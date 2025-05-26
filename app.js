@@ -7,27 +7,30 @@ const PORT = process.env.PORT || 3000;
 // Middleware to parse JSON request bodies
 app.use(express.json());
 
-// --- Helper function to read products from file ---
-function readProductsFromFile(callback) {
-  fs.readFile('products.json', 'utf8', (err, data) => {
+// --- Generic Helper function to read data from file ---
+function readDataFromFile(filePath, callback) {
+  fs.readFile(filePath, 'utf8', (err, data) => {
     if (err) {
       if (err.code === 'ENOENT') { // File not found
         return callback(null, []); // Return empty array if file doesn't exist
       }
       return callback(err); // Other read errors
     }
+    if (data === '') { // File is empty
+        return callback(null, []);
+    }
     try {
-      const products = JSON.parse(data);
-      return callback(null, products);
+      const jsonData = JSON.parse(data);
+      return callback(null, jsonData);
     } catch (parseError) {
       return callback(parseError); // JSON parsing error
     }
   });
 }
 
-// --- Helper function to write products to file ---
-function writeProductsToFile(products, callback) {
-  fs.writeFile('products.json', JSON.stringify(products, null, 2), 'utf8', (err) => {
+// --- Generic Helper function to write data to file ---
+function writeDataToFile(filePath, data, callback) {
+  fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8', (err) => {
     if (err) {
       return callback(err);
     }
@@ -35,18 +38,22 @@ function writeProductsToFile(products, callback) {
   });
 }
 
+// --- Helper function to generate a new ID ---
+function generateNewId(items) {
+  if (!items || items.length === 0) {
+    return 1;
+  }
+  return Math.max(...items.map(item => item.id || 0)) + 1;
+}
+
 // --- GET /products endpoint ---
 app.get('/products', (req, res, next) => {
-  readProductsFromFile((err, products) => {
+  readDataFromFile('products.json', (err, products) => {
     if (err) {
-      // Log the error for server-side inspection
       console.error("Error reading products.json:", err);
-      // For ENOENT, we decided to return empty array, but other errors are 500
-      if (err.code !== 'ENOENT') {
-        return next(err); // Pass to generic error handler
-      }
+      return next(err); // Pass to generic error handler
     }
-    res.json(products || []); // Send empty array if products is null/undefined (e.g. file was empty)
+    res.json(products);
   });
 });
 
@@ -65,19 +72,15 @@ app.post('/products', (req, res, next) => {
     return res.status(400).json({ message: 'Invalid product quantity. Quantity must be a non-negative integer.' });
   }
 
-  readProductsFromFile((err, products) => {
-    if (err && err.code !== 'ENOENT') { // Allow ENOENT to proceed, will create new file
+  readDataFromFile('products.json', (err, products) => {
+    if (err) {
         console.error("Error reading products.json for POST:", err);
         return next(err);
     }
-    
-    products = products || []; // Initialize if file was not found or empty
 
-    // --- Generate new product ID ---
-    const newId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 1;
-
+    const newProductId = generateNewId(products);
     const newProduct = {
-      id: newId,
+      id: newProductId,
       name: name.trim(),
       price,
       quantity
@@ -85,12 +88,114 @@ app.post('/products', (req, res, next) => {
 
     products.push(newProduct);
 
-    writeProductsToFile(products, (writeErr) => {
+    writeDataToFile('products.json', products, (writeErr) => {
       if (writeErr) {
         console.error("Error writing products.json:", writeErr);
         return next(writeErr);
       }
       res.status(201).json(newProduct);
+    });
+  });
+});
+
+// --- POST /checklists endpoint ---
+app.post('/checklists', (req, res, next) => {
+  const { nombre_operador, tipo_equipo, id_equipo, fecha_hora, checklist, observaciones } = req.body;
+
+  // --- Validation ---
+  if (!nombre_operador || typeof nombre_operador !== 'string' || nombre_operador.trim() === '') {
+    return res.status(400).json({ message: 'Nombre de operador inválido. Debe ser una cadena de texto no vacía.' });
+  }
+  if (!tipo_equipo || !['Montacargas', 'Apilador Eléctrico'].includes(tipo_equipo)) {
+    return res.status(400).json({ message: 'Tipo de equipo inválido. Debe ser "Montacargas" o "Apilador Eléctrico".' });
+  }
+  if (!id_equipo || (typeof id_equipo !== 'string' && typeof id_equipo !== 'number') || String(id_equipo).trim() === '') {
+    return res.status(400).json({ message: 'ID de equipo inválido. Debe ser una cadena de texto o número no vacío.' });
+  }
+  if (!fecha_hora || typeof fecha_hora !== 'string' || fecha_hora.trim() === '') { // Basic check, can be enhanced
+    return res.status(400).json({ message: 'Fecha y hora inválida. Debe ser una cadena de texto no vacía.' });
+  }
+  if (!checklist || !Array.isArray(checklist) || checklist.length === 0) {
+    return res.status(400).json({ message: 'Checklist inválido. Debe ser un arreglo no vacío.' });
+  }
+
+  for (const item of checklist) {
+    if (!item.item_name || typeof item.item_name !== 'string' || item.item_name.trim() === '') {
+      return res.status(400).json({ message: `Nombre de item inválido en checklist: "${item.item_name}". Debe ser una cadena de texto no vacía.` });
+    }
+    if (!item.status || !['OK', 'FALLA'].includes(item.status)) {
+      return res.status(400).json({ message: `Estado inválido para el item "${item.item_name}": "${item.status}". Debe ser "OK" o "FALLA".` });
+    }
+  }
+
+  const generatedAlerts = [];
+  for (const item of checklist) {
+    if (item.status === 'FALLA') {
+      generatedAlerts.push({
+        // checklist_id will be added later
+        id_equipo: String(id_equipo).trim(),
+        tipo_equipo,
+        item_name: item.item_name.trim(),
+        status_item: "FALLA", 
+        fecha_hora_checklist: fecha_hora,
+        observaciones_checklist: observaciones || "", 
+        alert_logged_time: new Date().toISOString()
+      });
+    }
+  }
+
+  readDataFromFile('./checklists.json', (err, checklistsData) => {
+    if (err) {
+      console.error("Error reading checklists.json:", err);
+      return next(err);
+    }
+
+    const newChecklistId = generateNewId(checklistsData);
+    const newChecklist = {
+      id: newChecklistId,
+      nombre_operador: nombre_operador.trim(),
+      tipo_equipo,
+      id_equipo: String(id_equipo).trim(),
+      fecha_hora,
+      checklist, // items in checklist will already have "status": "FALLA" or "OK"
+      observaciones: observaciones || ""
+    };
+
+    checklistsData.push(newChecklist);
+
+    writeDataToFile('./checklists.json', checklistsData, (writeErr) => {
+      if (writeErr) {
+        console.error("Error writing checklists.json:", writeErr);
+        return next(writeErr);
+      }
+
+      if (generatedAlerts.length > 0) {
+        // Assign checklist_id to alerts
+        generatedAlerts.forEach(alert => alert.checklist_id = newChecklistId);
+
+        readDataFromFile('./alertas_mantenimiento.json', (alertReadErr, maintenanceAlertsData) => {
+          if (alertReadErr) {
+            console.error("Error reading alertas_mantenimiento.json:", alertReadErr);
+            return next(alertReadErr);
+          }
+          
+          // Generate alert_id for each new alert before adding
+          generatedAlerts.forEach(alert => {
+            alert.alert_id = generateNewId(maintenanceAlertsData); 
+            maintenanceAlertsData.push(alert); 
+          });
+
+          writeDataToFile('./alertas_mantenimiento.json', maintenanceAlertsData, (alertWriteErr) => {
+            if (alertWriteErr) {
+              console.error("Error writing alertas_mantenimiento.json:", alertWriteErr);
+              return next(alertWriteErr);
+            }
+            res.status(201).json({ message: "Checklist enviado con éxito. Alertas de mantenimiento generadas.", checklist_id: newChecklistId });
+          });
+        });
+      } else {
+        res.status(201).json({ message: "Checklist enviado con éxito.", checklist_id: newChecklistId });
+      }
     });
   });
 });
